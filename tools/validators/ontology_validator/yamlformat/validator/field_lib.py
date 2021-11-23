@@ -30,6 +30,7 @@ from yamlformat.validator import subfield_lib
 
 # We currently are enforcing that fields are lower case only.
 FIELD_CHARACTER_REGEX = re.compile(r'^[a-z][a-z0-9]*(?:_[a-z][a-z0-9]*)*$')
+FIELD_INCREMENT_REGEX = re.compile(r'((?:_[0-9]+)*)$')
 
 
 def SplitFieldName(qualified_field_name):
@@ -113,15 +114,6 @@ class FieldFolder(config_folder_lib.ConfigFolder):
   global namespace) if we can guarantee that they will not conflict with other
   fields defined there.
 
-  Args:
-    folderpath: required string with full path to the folder containing fields.
-      Path should be relative to google3/ and have no leading or trailing /.
-    parent_namespace: object containing global namepsace information. When
-      working in the global namespace folder, treat it as local and leave this
-      blank.
-    local_subfields: required map of subfield keys to Subfields for the local
-      namespace.
-    local_states: required map of state keys to States for the local namespace.
   Attributes:
     local_namespace: object representing the contents of the local namespace
     parent_namespace: object representing the contents of the global namespace
@@ -135,6 +127,20 @@ class FieldFolder(config_folder_lib.ConfigFolder):
                parent_namespace=None,
                local_subfields=None,
                local_states=None):
+    """Init.
+
+    Args:
+      folderpath: required string with full path to the folder containing
+        fields. Path should be relative to google3/ and have no leading or
+        trailing /.
+      parent_namespace: object containing global namepsace information. When
+        working in the global namespace folder, treat it as local and leave this
+        blank.
+      local_subfields: required map of subfield keys to Subfields for the local
+        namespace.
+      local_states: required map of state keys to States for the local
+        namespace.
+    """
     super().__init__(folderpath, base_lib.ComponentType.FIELD)
     self.local_namespace = FieldNamespace(self._namespace_name, local_subfields,
                                           local_states, parent_namespace)
@@ -202,6 +208,8 @@ class _FieldValidationStateMachine(object):
     self._category_index = 0
     self._instance_count = 0
     self._has_measurement = False
+    self._has_aggregation = False
+    self._has_aggregation_descriptor = False
     self._has_required_fields = False
 
   _POINT_TYPES_NEEDING_MEASUREMENTS = ['setpoint', 'sensor', 'accumulator']
@@ -212,6 +220,10 @@ class _FieldValidationStateMachine(object):
   # Represents parameters for each subfield category.
   # Subfields are in the array in the order they should appear in the field.
   _CATEGORIES_IN_ORDER = [
+      _CAT_SPEC(
+          cat=subfield_lib.SubfieldCategory.AGGREGATION_DESCRIPTOR, 
+          required=False, 
+          max=1),
       _CAT_SPEC(
           cat=subfield_lib.SubfieldCategory.AGGREGATION, required=False, max=1),
       _CAT_SPEC(
@@ -239,17 +251,31 @@ class _FieldValidationStateMachine(object):
     """
     category = subfield.category
     while self._category_index < len(self._CATEGORIES_IN_ORDER):
+      # TODO(tsodorff): Add individual warnings for each specific failure.
       cat_spec = self._CATEGORIES_IN_ORDER[self._category_index]
       if category == cat_spec.cat:
         if self._instance_count < cat_spec.max:
           self._instance_count += 1
           if category == subfield_lib.SubfieldCategory.MEASUREMENT:
             self._has_measurement = True
+          if category == subfield_lib.SubfieldCategory.AGGREGATION:
+            self._has_aggregation = True
+          if category == subfield_lib.SubfieldCategory.AGGREGATION_DESCRIPTOR:
+            self._has_aggregation_descriptor = True
           if category == subfield_lib.SubfieldCategory.POINT_TYPE:
-            self._has_required_fields = True
+            # Verify that any aggregation descriptor comes with an aggregation. 
+            # Since this is the last subfield to evaluate this is where it 
+            # would have seen agg and agg_desc subfields by here. If this block
+            # doesnt exist, the field would fail anyway so the fact it didn't
+            # run this check won't matter.
+            if self._has_aggregation_descriptor and not self._has_aggregation:
+              return False
+            # Verify that, if there is no measurement, the point type specified
+            # does not explicitly require one.
             if not self._has_measurement:
               if subfield.name in self._POINT_TYPES_NEEDING_MEASUREMENTS:
                 return False
+            self._has_required_fields = True
           return True
         else:
           return False
@@ -271,14 +297,6 @@ class _FieldValidationStateMachine(object):
 class FieldNamespace(findings_lib.Findings):
   """Class representing a namespace of fields.
 
-  Args:
-    namespace: required string representing the name of the namespace. The
-      global namespace is represented by the empty string.
-    subfields: optional map of subfield names to Subfields. No validation of
-      subfields is performed if this is left empty
-    states: optional map of state names to States. No validation of states is
-      performed if this isn't provided
-    parent_namespace: global FieldNamespace object, if this is not it.
   Attributes:
     fields: a dictionary of Field keys to field objects for fields added to
       this namespace.  NB: a field key is a permutation of the field name with
@@ -300,6 +318,20 @@ class FieldNamespace(findings_lib.Findings):
                subfields=None,
                states=None,
                parent_namespace=None):
+    """Init.
+
+    Args:
+      namespace: required string representing the name of the namespace. The
+        global namespace is represented by the empty string.
+      subfields: optional map of subfield names to Subfields. No validation of
+        subfields is performed if this is left empty
+      states: optional map of state names to States. No validation of states is
+        performed if this isn't provided
+      parent_namespace: global FieldNamespace object, if this is not it.
+
+    Raises:
+      RuntimeError: when subfields are defined on the child and not the parent.
+    """
     super(FieldNamespace, self).__init__()
     self.namespace = namespace
     self.subfields = subfields
@@ -482,11 +514,6 @@ class FieldNamespace(findings_lib.Findings):
 class Field(findings_lib.Findings):
   """Namespace-unaware class representing an individual field definition.
 
-  Args:
-    name: required string representing the field.
-    states: optional list of strings representing valid states for a multistate
-      field. Should be None for non-multistate fields.
-    context: optional object with the config file location of this field.
   Attributes:
     context: the config file context for where this field was defined
     name: the full name (without namespace) of this field
@@ -499,6 +526,14 @@ class Field(findings_lib.Findings):
   """
 
   def __init__(self, name, states=None, context=None):
+    """Init.
+
+    Args:
+      name: required string representing the field.
+      states: optional list of strings representing valid states for a
+        multistate field. Should be None for non-multistate fields.
+      context: optional object with the config file location of this field.
+    """
     super(Field, self).__init__()
     self.context = context
     self.name = name
